@@ -1,42 +1,41 @@
 """
-NovaTech - Simulador concurrente de pedidos
-Fase 2: Logica de sincronizacion (trabajadores)
+NovaTech - Concurrent Order Processing Simulator
+Phase 2: Synchronization logic (workers)
 
-Este modulo define:
-  - Un objeto SharedState que agrupa todos los recursos compartidos y sus
-    locks (inventario, contadores, log de resultados).
-  - La funcion trabajador() que ejecuta cada hilo Worker: toma pedidos de
-    la cola, simula tiempo de procesamiento FUERA del lock, y valida +
-    descuenta inventario DENTRO de una seccion critica minima.
+This module defines:
+  - A SharedState object that groups all shared resources and their
+    locks (inventory, counters, results log).
+  - The worker() function that each Worker thread runs: it takes orders
+    from the queue, simulates processing time OUTSIDE the lock, and
+    validates + deducts inventory INSIDE a minimal critical section.
 
-Decisiones de diseno clave (se piden explicarlas en el informe, Fase 5):
+Key design decisions (explained further in the report, Phase 5):
 
-1. Un solo Lock protege el inventario (`self.lock_inventario`). Se eligio
-   un unico lock (en vez de uno por producto) porque el catalogo es
-   pequeno (5 productos) y un pedido puede tener varios items de
-   distintos productos: usar locks por producto obligaria a un protocolo
-   de multiples locks con riesgo de deadlock (orden de adquisicion). Con
-   un solo lock evitamos esa complejidad; el costo en concurrencia es
-   aceptable porque la seccion critica es muy corta (solo lectura +
-   resta de enteros, sin I/O).
+1. A single Lock protects the inventory (`self.inventory_lock`). We chose
+   a single lock (instead of one per product) because the catalog is
+   small (5 products) and an order can contain several items across
+   different products: using per-product locks would require a
+   multi-lock acquisition protocol with deadlock risk (lock ordering).
+   With a single lock we avoid that complexity; the cost in concurrency
+   is acceptable because the critical section is very short (only reads
+   and integer subtraction, no I/O).
 
-2. La simulacion de trabajo (0.5 a 2 segundos, time.sleep) se hace ANTES
-   de tomar el lock, nunca dentro. Esto cumple la regla del enunciado:
-   "No mantenga un lock durante esperas artificiales... o pausas de
-   simulacion".
+2. The work simulation (0.5 to 2 seconds, time.sleep) happens BEFORE
+   acquiring the lock, never inside it. This satisfies the assignment's
+   rule: "Do not hold a lock during artificial waits... or simulation
+   pauses."
 
-3. Los contadores (aprobados, rechazados, error) y el log de eventos usan
-   el MISMO lock que el inventario cuando se actualizan junto con el
-   descuento (para que el conteo sea consistente con el estado del
-   inventario en todo momento), pero se usa un lock aparte
-   (`lock_contadores`) para los casos que no tocan inventario (pedidos
-   invalidos), de modo que un pedido invalido no compita por el lock del
-   inventario innecesariamente.
+3. Counters (approved, rejected, error) and the event log use the SAME
+   lock as the inventory when they are updated together with the
+   deduction (so the count stays consistent with the inventory state at
+   all times), but a separate lock (`counters_lock`) is used for cases
+   that do not touch inventory (invalid orders), so an invalid order
+   does not compete for the inventory lock unnecessarily.
 
-4. queue.Queue.get() ya es thread-safe: dos workers nunca pueden extraer
-   el mismo Pedido de la cola. Por eso "pedido duplicado" no puede
-   ocurrir a nivel de la cola; el riesgo real esta en el inventario, que
-   es lo que protegemos explicitamente aqui.
+4. queue.Queue.get() is already thread-safe: two workers can never pull
+   the same Order from the queue. That is why "duplicate order" cannot
+   occur at the queue level; the real risk is in the inventory, which is
+   what we explicitly protect here.
 """
 
 import threading
@@ -47,255 +46,258 @@ from queue import Queue, Empty
 
 
 # ---------------------------------------------------------------------------
-# Estado compartido
+# Shared state
 # ---------------------------------------------------------------------------
 
 class SharedState:
     """
-    Agrupa todos los recursos que los hilos comparten, junto con los
-    mecanismos de sincronizacion que los protegen.
+    Groups all the resources the threads share, along with the
+    synchronization mechanisms that protect them.
 
-    inventario:          dict codigo -> {nombre, existencia}. Protegido por
-                          lock_inventario.
-    lock_inventario:      Lock que protege la seccion critica: verificar
-                          existencia + descontar, como UNA sola operacion
-                          atomica.
-    contadores:           dict con aprobados/rechazados/error. Protegido
-                          por lock_contadores (o por lock_inventario cuando
-                          la actualizacion ocurre junto con el descuento,
-                          para mantener una sola seccion critica corta).
-    lock_contadores:       Lock separado para actualizaciones de contadores
-                          que no requieren tocar el inventario (ej. pedidos
-                          invalidos).
-    eventos:              lista de tuplas (timestamp, mensaje) para el log
-                          final. Protegida por lock_eventos.
-    lock_eventos:          Lock para el log, para que las lineas no se
-                          intercalen a nivel de caracteres al imprimir.
-    trabajadores_activos: contador de workers que siguen vivos, que el
-                          monitor consulta periodicamente. Protegido por
-                          lock_contadores tambien (es una cifra mas).
+    inventory:        dict code -> {name, stock}. Protected by
+                       inventory_lock.
+    inventory_lock:    Lock protecting the critical section: checking
+                       stock + deducting it, as ONE atomic operation.
+    counters:          dict with approved/rejected/error counts.
+                       Protected by counters_lock (or by inventory_lock
+                       when the update happens together with the
+                       deduction, to keep a single short critical
+                       section).
+    counters_lock:     Separate lock for counter updates that don't
+                       require touching inventory (e.g. invalid orders).
+    events:            list of (timestamp, message) tuples for the final
+                       log. Protected by events_lock.
+    events_lock:       Lock for the log, so lines don't interleave at
+                       the character level when printing.
+    active_workers:    count of workers still alive, which the monitor
+                       checks periodically. Also protected by
+                       counters_lock (it's just another figure).
     """
 
-    def __init__(self, inventario_inicial):
-        self.inventario = inventario_inicial
-        self.lock_inventario = threading.Lock()
+    def __init__(self, initial_inventory):
+        self.inventory = initial_inventory
+        self.inventory_lock = threading.Lock()
 
-        self.contadores = {
-            "aprobados": 0,
-            "rechazados": 0,
+        self.counters = {
+            "approved": 0,
+            "rejected": 0,
             "error": 0,
-            "procesados": 0,
+            "processed": 0,
         }
-        self.lock_contadores = threading.Lock()
+        self.counters_lock = threading.Lock()
 
-        self.eventos = []
-        self.lock_eventos = threading.Lock()
+        self.events = []
+        self.events_lock = threading.Lock()
 
-        self.trabajadores_activos = 0
+        self.active_workers = 0
 
-    # -- utilidades de registro -------------------------------------------------
+    # -- logging utilities -------------------------------------------------
 
-    def registrar_evento(self, mensaje: str):
+    def log_event(self, message: str):
         """
-        Agrega una linea al log compartido y la imprime inmediatamente.
-        Se usa un lock corto solo para el 'print' + append, nunca para
-        trabajo lento, por lo que no genera contencion significativa
-        aunque muchos hilos escriban al mismo tiempo.
+        Appends a line to the shared log and prints it immediately.
+        A short lock is used only for the 'print' + append, never for
+        slow work, so it does not create significant contention even if
+        many threads write at the same time.
         """
-        marca_tiempo = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        linea = f"[{marca_tiempo}] {mensaje}"
-        with self.lock_eventos:
-            self.eventos.append(linea)
-            print(linea, flush=True)
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        line = f"[{timestamp}] {message}"
+        with self.events_lock:
+            self.events.append(line)
+            print(line, flush=True)
 
 
 # ---------------------------------------------------------------------------
-# Validacion de pedidos (fuera de la seccion critica: es logica pura,
-# no toca el inventario compartido).
+# Order validation (outside the critical section: it is pure logic,
+# it does not touch the shared inventory).
 # ---------------------------------------------------------------------------
 
-def validar_estructura_pedido(pedido, inventario_codigos):
+def validate_order_structure(order, inventory_codes):
     """
-    Revisa que el pedido este bien formado ANTES de intentar tocar el
-    inventario. No requiere lock porque solo lee datos propios del pedido
-    y una lista de codigos validos que no cambia en tiempo de ejecucion.
+    Checks that the order is well-formed BEFORE attempting to touch the
+    inventory. No lock is required because it only reads data that
+    belongs to the order plus a list of valid codes that does not change
+    at runtime.
 
-    Devuelve (es_valido: bool, motivo: str).
+    Returns (is_valid: bool, reason: str).
     """
-    if not pedido.cliente or not pedido.cliente.strip():
-        return False, "Cliente vacio o invalido"
+    if not order.customer or not order.customer.strip():
+        return False, "Empty or invalid customer"
 
-    if not pedido.items:
-        return False, "Pedido sin items"
+    if not order.items:
+        return False, "Order with no items"
 
-    for item in pedido.items:
-        if item.codigo_producto not in inventario_codigos:
-            return False, f"Producto inexistente: {item.codigo_producto}"
-        if item.cantidad is None or item.cantidad <= 0:
-            return False, f"Cantidad invalida ({item.cantidad}) para {item.codigo_producto}"
+    for item in order.items:
+        if item.product_code not in inventory_codes:
+            return False, f"Nonexistent product: {item.product_code}"
+        if item.quantity is None or item.quantity <= 0:
+            return False, f"Invalid quantity ({item.quantity}) for {item.product_code}"
 
     return True, ""
 
 
 # ---------------------------------------------------------------------------
-# Funcion ejecutada por cada hilo trabajador
+# Function executed by each worker thread
 # ---------------------------------------------------------------------------
 
-def trabajador(nombre_worker: str, cola_pedidos: Queue, estado: SharedState,
-                simular_tiempo=True, rango_espera=(0.5, 2.0)):
+def worker(worker_name: str, order_queue: Queue, state: SharedState,
+           simulate_time=True, wait_range=(0.5, 2.0)):
     """
-    Ciclo de vida de un hilo trabajador (RF-03, RF-04, RF-05, RF-06, RF-08):
+    Life cycle of a worker thread (RF-03, RF-04, RF-05, RF-06, RF-08):
 
-      1. Extrae un pedido de la cola compartida (thread-safe por diseno de
-         queue.Queue). Si la cola esta vacia, el worker termina (esa es su
-         condicion de finalizacion, segun la tabla del enunciado).
-      2. Valida la ESTRUCTURA del pedido (sin tocar inventario). Si esta
-         mal formado, se registra como error y se continua con el
-         siguiente pedido, sin detener a los demas trabajadores (RF-08).
-      3. Simula el tiempo de procesamiento (0.5 a 2s) FUERA de cualquier
-         lock, como exige el enunciado.
-      4. Entra a la SECCION CRITICA: verifica existencia y descuenta el
-         inventario como una sola operacion atomica protegida por
-         estado.lock_inventario. Si no alcanza el stock, rechaza el
-         pedido SIN modificar el inventario.
-      5. Registra el resultado (aprobado/rechazado/error) con hora, hilo,
-         id, cliente y motivo.
+      1. Pulls an order from the shared queue (thread-safe by design of
+         queue.Queue). If the queue is empty, the worker terminates
+         (that is its termination condition, per the assignment's
+         table).
+      2. Validates the order's STRUCTURE (without touching inventory).
+         If it is malformed, it is logged as an error and the worker
+         moves on to the next order, without stopping the other workers
+         (RF-08).
+      3. Simulates processing time (0.5 to 2s) OUTSIDE any lock, as
+         required by the assignment.
+      4. Enters the CRITICAL SECTION: checks stock and deducts inventory
+         as a single atomic operation protected by
+         state.inventory_lock. If stock is insufficient, the order is
+         rejected WITHOUT modifying the inventory.
+      5. Logs the result (approved/rejected/error) with time, thread,
+         id, customer, and rejection reason.
 
-    Con try/except alrededor del procesamiento de cada pedido, un pedido
-    problematico jamas puede tumbar el hilo completo (RF-08).
+    With try/except around the processing of each order, a problematic
+    order can never bring down the entire thread (RF-08).
     """
-    with estado.lock_contadores:
-        estado.trabajadores_activos += 1
+    with state.counters_lock:
+        state.active_workers += 1
 
-    estado.registrar_evento(f"[{nombre_worker}] Hilo iniciado.")
+    state.log_event(f"[{worker_name}] Thread started.")
 
     try:
         while True:
             try:
-                # Extraccion no bloqueante: si no hay pedidos, el worker
-                # termina en vez de esperar indefinidamente (condicion de
-                # finalizacion: "cuando no quedan pedidos pendientes").
-                pedido = cola_pedidos.get_nowait()
+                # Non-blocking extraction: if there are no orders left,
+                # the worker terminates instead of waiting indefinitely
+                # (termination condition: "when there are no pending
+                # orders left").
+                order = order_queue.get_nowait()
             except Empty:
                 break
 
             try:
-                estado.registrar_evento(
-                    f"[{nombre_worker}] Inicia pedido {pedido.id_pedido} | Cliente: {pedido.cliente}"
+                state.log_event(
+                    f"[{worker_name}] Starting order {order.order_id} | Customer: {order.customer}"
                 )
 
-                # --- 1) Validacion de estructura (fuera del lock) ---
-                es_valido, motivo = validar_estructura_pedido(
-                    pedido, estado.inventario.keys()
+                # --- 1) Structure validation (outside the lock) ---
+                is_valid, reason = validate_order_structure(
+                    order, state.inventory.keys()
                 )
-                if not es_valido:
-                    with estado.lock_contadores:
-                        estado.contadores["error"] += 1
-                        estado.contadores["procesados"] += 1
-                    estado.registrar_evento(
-                        f"[{nombre_worker}] {pedido.id_pedido} ERROR | Motivo: {motivo}"
+                if not is_valid:
+                    with state.counters_lock:
+                        state.counters["error"] += 1
+                        state.counters["processed"] += 1
+                    state.log_event(
+                        f"[{worker_name}] {order.order_id} ERROR | Reason: {reason}"
                     )
                     continue
 
-                # --- 2) Simulacion de trabajo, FUERA de la seccion critica ---
-                if simular_tiempo:
-                    time.sleep(random.uniform(*rango_espera))
+                # --- 2) Work simulation, OUTSIDE the critical section ---
+                if simulate_time:
+                    time.sleep(random.uniform(*wait_range))
 
-                # --- 3) SECCION CRITICA: verificar + descontar inventario ---
-                # Esta es la unica parte protegida por lock_inventario.
-                # Se mantiene lo mas corta posible: solo comparaciones y
-                # restas de enteros, sin sleep ni I/O adentro.
-                aprobado = False
-                detalle_descuento = []
-                motivo_rechazo = ""
+                # --- 3) CRITICAL SECTION: check + deduct inventory ---
+                # This is the only part protected by inventory_lock.
+                # It is kept as short as possible: only comparisons and
+                # integer subtraction, no sleep or I/O inside.
+                approved = False
+                deduction_details = []
+                rejection_reason = ""
 
-                with estado.lock_inventario:
-                    # Verificar que TODOS los items del pedido tengan stock
-                    # suficiente antes de descontar cualquiera (para que un
-                    # pedido con varios productos sea todo o nada).
-                    suficiente = all(
-                        estado.inventario[item.codigo_producto]["existencia"] >= item.cantidad
-                        for item in pedido.items
+                with state.inventory_lock:
+                    # Check that ALL items in the order have enough
+                    # stock before deducting any of them (so an order
+                    # with several products is all-or-nothing).
+                    sufficient = all(
+                        state.inventory[item.product_code]["stock"] >= item.quantity
+                        for item in order.items
                     )
 
-                    if suficiente:
-                        for item in pedido.items:
-                            estado.inventario[item.codigo_producto]["existencia"] -= item.cantidad
-                            detalle_descuento.append(f"{item.codigo_producto}: -{item.cantidad} unidades")
-                        aprobado = True
+                    if sufficient:
+                        for item in order.items:
+                            state.inventory[item.product_code]["stock"] -= item.quantity
+                            deduction_details.append(f"{item.product_code}: -{item.quantity} units")
+                        approved = True
                     else:
-                        # Identificar cual producto no alcanzo, solo para
-                        # el mensaje (no modifica nada).
-                        for item in pedido.items:
-                            disponible = estado.inventario[item.codigo_producto]["existencia"]
-                            if disponible < item.cantidad:
-                                motivo_rechazo = f"Stock insuficiente {item.codigo_producto} (disponible={disponible}, pedido={item.cantidad})"
+                        # Identify which product fell short, just for
+                        # the message (does not modify anything).
+                        for item in order.items:
+                            available = state.inventory[item.product_code]["stock"]
+                            if available < item.quantity:
+                                rejection_reason = f"Insufficient stock {item.product_code} (available={available}, requested={item.quantity})"
                                 break
 
-                # --- 4) Registro del resultado (fuera del lock de inventario) ---
-                with estado.lock_contadores:
-                    estado.contadores["procesados"] += 1
-                    if aprobado:
-                        estado.contadores["aprobados"] += 1
+                # --- 4) Result logging (outside the inventory lock) ---
+                with state.counters_lock:
+                    state.counters["processed"] += 1
+                    if approved:
+                        state.counters["approved"] += 1
                     else:
-                        estado.contadores["rechazados"] += 1
+                        state.counters["rejected"] += 1
 
-                if aprobado:
-                    estado.registrar_evento(
-                        f"[{nombre_worker}] {pedido.id_pedido} APROBADO | {', '.join(detalle_descuento)}"
+                if approved:
+                    state.log_event(
+                        f"[{worker_name}] {order.order_id} APPROVED | {', '.join(deduction_details)}"
                     )
                 else:
-                    estado.registrar_evento(
-                        f"[{nombre_worker}] {pedido.id_pedido} RECHAZADO | {motivo_rechazo}"
+                    state.log_event(
+                        f"[{worker_name}] {order.order_id} REJECTED | {rejection_reason}"
                     )
 
             except Exception as exc:
-                # Cualquier error inesperado al procesar UN pedido no debe
-                # detener al worker ni a los demas (RF-08).
-                with estado.lock_contadores:
-                    estado.contadores["error"] += 1
-                    estado.contadores["procesados"] += 1
-                estado.registrar_evento(
-                    f"[{nombre_worker}] {pedido.id_pedido} ERROR INESPERADO | {exc}"
+                # Any unexpected error while processing ONE order must
+                # not stop the worker or the other workers (RF-08).
+                with state.counters_lock:
+                    state.counters["error"] += 1
+                    state.counters["processed"] += 1
+                state.log_event(
+                    f"[{worker_name}] {order.order_id} UNEXPECTED ERROR | {exc}"
                 )
     finally:
-        with estado.lock_contadores:
-            estado.trabajadores_activos -= 1
-        estado.registrar_evento(f"[{nombre_worker}] Hilo finalizado. Sin pedidos pendientes.")
+        with state.counters_lock:
+            state.active_workers -= 1
+        state.log_event(f"[{worker_name}] Thread finished. No pending orders.")
 
 
 # ---------------------------------------------------------------------------
-# Prueba rapida de la Fase 2 (crea 3 workers manualmente, sin monitor
-# todavia -- el monitor y el hilo principal completo llegan en la Fase 3).
+# Quick self-test for Phase 2 (creates 3 workers manually, no monitor yet
+# -- the monitor and the full main thread arrive in Phase 3).
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    from models import crear_inventario, generar_pedidos, crear_cola_pedidos
+    from models import create_inventory, generate_orders, create_order_queue
 
-    inventario = crear_inventario()
-    pedidos = generar_pedidos()
-    cola = crear_cola_pedidos(pedidos)
-    estado = SharedState(inventario)
+    inventory = create_inventory()
+    orders = generate_orders()
+    order_queue = create_order_queue(orders)
+    state = SharedState(inventory)
 
-    hilos = []
+    threads = []
     for i in range(1, 4):
-        t = threading.Thread(target=trabajador, args=(f"WORKER-{i}", cola, estado), daemon=False)
-        hilos.append(t)
+        t = threading.Thread(target=worker, args=(f"WORKER-{i}", order_queue, state), daemon=False)
+        threads.append(t)
 
-    inicio = time.time()
-    for t in hilos:
+    start = time.time()
+    for t in threads:
         t.start()
-    for t in hilos:
+    for t in threads:
         t.join()
-    fin = time.time()
+    end = time.time()
 
     print("\n--------------------------------------------------------------------")
-    print("RESUMEN (prueba de Fase 2, sin monitor)")
-    print(f"Procesados: {estado.contadores['procesados']} | "
-          f"Aprobados: {estado.contadores['aprobados']} | "
-          f"Rechazados: {estado.contadores['rechazados']} | "
-          f"Error: {estado.contadores['error']}")
-    print(f"Tiempo total: {fin - inicio:.2f} s")
-    print("\nInventario final:")
-    for codigo, datos in estado.inventario.items():
-        print(f"  {codigo}: {datos['nombre']:<22} existencia={datos['existencia']}")
+    print("SUMMARY (Phase 2 test, no monitor)")
+    print(f"Processed: {state.counters['processed']} | "
+          f"Approved: {state.counters['approved']} | "
+          f"Rejected: {state.counters['rejected']} | "
+          f"Error: {state.counters['error']}")
+    print(f"Total time: {end - start:.2f} s")
+    print("\nFinal inventory:")
+    for code, data in state.inventory.items():
+        print(f"  {code}: {data['name']:<22} stock={data['stock']}")
