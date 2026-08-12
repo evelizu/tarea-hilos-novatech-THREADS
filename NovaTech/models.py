@@ -1,16 +1,16 @@
 """
-NovaTech - Simulador concurrente de pedidos
-Fase 1: Estructuras de datos e inventario
+NovaTech - Concurrent Order Processing Simulator
+Phase 1: Data structures and inventory
 
-Este modulo define:
-  - El inventario inicial (compartido entre hilos).
-  - La estructura de un Pedido.
-  - La generacion de al menos 20 pedidos de prueba.
-  - La cola compartida (thread-safe) que usaran los trabajadores.
+This module defines:
+  - The initial inventory (shared across threads).
+  - The Order data structure.
+  - Generation of at least 20 test orders.
+  - The shared (thread-safe) queue used by the worker threads.
 
-Nota de diseno: separamos "datos" (este archivo) de "sincronizacion"
-(Fase 2), para que el lock que protege el inventario se defina y se use
-junto con la logica de los trabajadores, no aqui.
+Design note: "data" (this file) is kept separate from "synchronization"
+(Phase 2), so the lock that protects the inventory is defined and used
+together with the worker logic, not here.
 """
 
 from dataclasses import dataclass, field
@@ -19,189 +19,189 @@ import random
 
 
 # ---------------------------------------------------------------------------
-# Inventario inicial
+# Initial inventory
 # ---------------------------------------------------------------------------
-# Se representa como un diccionario simple: codigo -> {nombre, existencia}.
-# Este diccionario sera el "recurso compartido" que los trabajadores leeran
-# y modificaran en la Fase 2, protegido por un Lock.
+# Represented as a simple dictionary: code -> {name, stock}.
+# This dictionary will be the "shared resource" that workers read from and
+# modify in Phase 2, protected by a Lock.
 
-INVENTARIO_INICIAL = {
-    "P001": {"nombre": "Teclado mecanico",     "existencia": 12},
-    "P002": {"nombre": "Mouse inalambrico",    "existencia": 18},
-    "P003": {"nombre": "Audifonos USB",        "existencia": 10},
-    "P004": {"nombre": "Camara web",           "existencia": 8},
-    "P005": {"nombre": "Monitor de 24 pulgadas","existencia": 6},
+INITIAL_INVENTORY = {
+    "P001": {"name": "Mechanical keyboard", "stock": 12},
+    "P002": {"name": "Wireless mouse",      "stock": 18},
+    "P003": {"name": "USB headphones",      "stock": 10},
+    "P004": {"name": "Webcam",              "stock": 8},
+    "P005": {"name": "24-inch monitor",     "stock": 6},
 }
 
 
-def crear_inventario():
+def create_inventory():
     """
-    Devuelve una copia nueva del inventario inicial.
+    Returns a fresh copy of the initial inventory.
 
-    Usamos una funcion (en vez de reusar el diccionario global directamente)
-    para que cada ejecucion del programa (o cada caso de prueba) empiece
-    desde un estado limpio, sin arrastrar cambios de una corrida anterior.
+    We use a function (instead of reusing the global dictionary directly)
+    so every run of the program (or every test case) starts from a clean
+    state, without carrying over changes from a previous run.
     """
     return {
-        codigo: {"nombre": datos["nombre"], "existencia": datos["existencia"]}
-        for codigo, datos in INVENTARIO_INICIAL.items()
+        code: {"name": data["name"], "stock": data["stock"]}
+        for code, data in INITIAL_INVENTORY.items()
     }
 
 
 # ---------------------------------------------------------------------------
-# Estructura de un pedido
+# Order structure
 # ---------------------------------------------------------------------------
 
 @dataclass
-class ItemPedido:
-    """Un producto solicitado dentro de un pedido, con su cantidad."""
-    codigo_producto: str
-    cantidad: int
+class OrderItem:
+    """A single product requested within an order, with its quantity."""
+    product_code: str
+    quantity: int
 
 
 @dataclass
-class Pedido:
+class Order:
     """
-    Representa un pedido del cliente.
+    Represents a customer order.
 
-    id_pedido:  identificador unico (ej. 'ORD-007').
-    cliente:    nombre del cliente.
-    items:      lista de ItemPedido (un pedido puede tener 1+ productos).
-    valido:     bandera que marcamos en False si el pedido viene mal
-                formado (sin codigo, cantidad <= 0, etc.). Esto nos permite
-                generar pedidos invalidos a proposito para el caso de
-                prueba CP-04, sin romper la carga de datos.
+    order_id:       unique identifier (e.g. 'ORD-007').
+    customer:       customer name.
+    items:          list of OrderItem (an order can contain 1+ products).
+    is_valid:       flag we set to False when the order is malformed
+                    (missing code, quantity <= 0, etc.). This lets us
+                    generate intentionally invalid orders for test case
+                    CP-04 without breaking the data-loading step.
+    invalid_reason: reason for invalidity, if any.
     """
-    id_pedido: str
-    cliente: str
+    order_id: str
+    customer: str
     items: list = field(default_factory=list)
-    valido: bool = True
-    motivo_invalido: str = ""
+    is_valid: bool = True
+    invalid_reason: str = ""
 
 
 # ---------------------------------------------------------------------------
-# Generacion de pedidos de prueba (>= 20, con casos normales, de
-# contencion, de stock insuficiente y malformados)
+# Test order generation (>= 20, covering normal, contention, insufficient
+# stock, and malformed cases)
 # ---------------------------------------------------------------------------
 
-def generar_pedidos(cantidad: int = 24, semilla: int = 42):
+def generate_orders(count: int = 24, seed: int = 42):
     """
-    Genera una lista de pedidos de prueba.
+    Generates a list of test orders.
 
-    Se incluyen intencionalmente:
-      - Pedidos normales (stock suficiente).
-      - Varios pedidos que compiten por el mismo producto con poca
-        existencia (para forzar contencion real sobre el lock, ej. P005
-        que solo tiene 6 unidades).
-      - Al menos un pedido que pide mas unidades de las disponibles.
-      - Al menos un pedido invalido (codigo inexistente, cantidad 0 o
-        estructura incompleta) para el caso de prueba CP-04.
+    Intentionally included:
+      - Normal orders (sufficient stock).
+      - Several orders competing for the same low-stock product (to force
+        real contention on the lock, e.g. P005 which only has 6 units).
+      - At least one order requesting more units than available.
+      - At least one invalid order (nonexistent code, zero quantity, or
+        an incomplete structure) for test case CP-04.
 
-    Se usa una semilla fija para que la ejecucion sea reproducible,
-    tal como exige el README/rubrica.
+    A fixed seed is used so the run is reproducible, as required by the
+    README/rubric.
     """
-    random.seed(semilla)
-    nombres_clientes = [
+    random.seed(seed)
+    customer_names = [
         "Ana Lopez", "Mario Perez", "Lucia Gomez", "Carlos Ruiz",
         "Elena Torres", "Diego Ramirez", "Sofia Castillo", "Jorge Diaz",
         "Valeria Mendez", "Pablo Rios", "Camila Ortiz", "Andres Vargas",
     ]
-    codigos_validos = list(INVENTARIO_INICIAL.keys())
+    valid_codes = list(INITIAL_INVENTORY.keys())
 
-    pedidos = []
+    orders = []
 
-    # 1) Pedidos normales: cantidades pequenas, dentro de la existencia.
+    # 1) Normal orders: small quantities, within available stock.
     for i in range(1, 13):
-        codigo = random.choice(codigos_validos)
-        cantidad_pedida = random.randint(1, 3)
-        pedidos.append(Pedido(
-            id_pedido=f"ORD-{i:03d}",
-            cliente=random.choice(nombres_clientes),
-            items=[ItemPedido(codigo, cantidad_pedida)],
+        code = random.choice(valid_codes)
+        requested_quantity = random.randint(1, 3)
+        orders.append(Order(
+            order_id=f"ORD-{i:03d}",
+            customer=random.choice(customer_names),
+            items=[OrderItem(code, requested_quantity)],
         ))
 
-    # 2) Pedidos de contencion: varios compiten por P005 (solo 6 unidades)
-    #    para forzar que el mecanismo de sincronizacion se ejercite de
-    #    verdad (CP-02).
+    # 2) Contention orders: several compete for P005 (only 6 units) to
+    #    force the synchronization mechanism to be genuinely exercised
+    #    (CP-02).
     for i in range(13, 18):
-        pedidos.append(Pedido(
-            id_pedido=f"ORD-{i:03d}",
-            cliente=random.choice(nombres_clientes),
-            items=[ItemPedido("P005", 2)],  # 5 pedidos x 2 = 10 > 6 disponibles
+        orders.append(Order(
+            order_id=f"ORD-{i:03d}",
+            customer=random.choice(customer_names),
+            items=[OrderItem("P005", 2)],  # 5 orders x 2 = 10 > 6 available
         ))
 
-    # 3) Pedido con stock claramente insuficiente (CP-03).
-    pedidos.append(Pedido(
-        id_pedido="ORD-018",
-        cliente="Mariana Solis",
-        items=[ItemPedido("P004", 999)],
+    # 3) Order with clearly insufficient stock (CP-03).
+    orders.append(Order(
+        order_id="ORD-018",
+        customer="Mariana Solis",
+        items=[OrderItem("P004", 999)],
     ))
 
-    # 4) Pedidos invalidos / mal formados (CP-04): codigo inexistente,
-    #    cantidad cero y cantidad negativa.
-    pedidos.append(Pedido(
-        id_pedido="ORD-019",
-        cliente="Cliente Fantasma",
-        items=[ItemPedido("P999", 1)],  # producto que no existe
+    # 4) Invalid / malformed orders (CP-04): nonexistent code, zero
+    #    quantity, and negative quantity.
+    orders.append(Order(
+        order_id="ORD-019",
+        customer="Ghost Customer",
+        items=[OrderItem("P999", 1)],  # product that does not exist
     ))
-    pedidos.append(Pedido(
-        id_pedido="ORD-020",
-        cliente="Roberto Nunez",
-        items=[ItemPedido("P002", 0)],  # cantidad invalida
+    orders.append(Order(
+        order_id="ORD-020",
+        customer="Roberto Nunez",
+        items=[OrderItem("P002", 0)],  # invalid quantity
     ))
-    pedidos.append(Pedido(
-        id_pedido="ORD-021",
-        cliente="",  # cliente vacio -> tambien invalido
-        items=[ItemPedido("P001", -2)],
+    orders.append(Order(
+        order_id="ORD-021",
+        customer="",  # empty customer -> also invalid
+        items=[OrderItem("P001", -2)],
     ))
 
-    # 5) Rellenar hasta 'cantidad' con pedidos normales adicionales, por si
-    #    se pide un total mayor a 21.
-    siguiente = 22
-    while len(pedidos) < cantidad:
-        codigo = random.choice(codigos_validos)
-        pedidos.append(Pedido(
-            id_pedido=f"ORD-{siguiente:03d}",
-            cliente=random.choice(nombres_clientes),
-            items=[ItemPedido(codigo, random.randint(1, 2))],
+    # 5) Fill up to 'count' with additional normal orders, in case a
+    #    total greater than 21 is requested.
+    next_id = 22
+    while len(orders) < count:
+        code = random.choice(valid_codes)
+        orders.append(Order(
+            order_id=f"ORD-{next_id:03d}",
+            customer=random.choice(customer_names),
+            items=[OrderItem(code, random.randint(1, 2))],
         ))
-        siguiente += 1
+        next_id += 1
 
-    return pedidos
+    return orders
 
 
-def crear_cola_pedidos(pedidos):
+def create_order_queue(orders):
     """
-    Coloca la lista de pedidos dentro de una queue.Queue, que es thread-safe
-    por diseño (usa un lock internamente). Esta sera la 'Cola compartida de
-    pedidos' que los 3+ trabajadores consumiran concurrentemente en la
-    Fase 2, cada uno haciendo cola.get() sin riesgo de tomar el mismo
-    pedido dos veces.
+    Places the list of orders into a queue.Queue, which is thread-safe by
+    design (it uses an internal lock). This will be the 'shared order
+    queue' that the 3+ workers consume concurrently in Phase 2, each one
+    calling queue.get() with no risk of two workers taking the same
+    order.
     """
-    cola = Queue()
-    for pedido in pedidos:
-        cola.put(pedido)
-    return cola
+    order_queue = Queue()
+    for order in orders:
+        order_queue.put(order)
+    return order_queue
 
 
 # ---------------------------------------------------------------------------
-# Prueba rapida de la Fase 1 (se puede ejecutar este archivo directamente
-# para verificar que los datos se generan correctamente antes de pasar a
-# la logica de hilos).
+# Quick self-test for Phase 1 (this file can be run directly to verify
+# that the data is generated correctly before moving on to the threading
+# logic).
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    inventario = crear_inventario()
-    pedidos = generar_pedidos()
-    cola = crear_cola_pedidos(pedidos)
+    inventory = create_inventory()
+    orders = generate_orders()
+    order_queue = create_order_queue(orders)
 
-    print("=== INVENTARIO INICIAL ===")
-    for codigo, datos in inventario.items():
-        print(f"  {codigo}: {datos['nombre']:<22} existencia={datos['existencia']}")
+    print("=== INITIAL INVENTORY ===")
+    for code, data in inventory.items():
+        print(f"  {code}: {data['name']:<22} stock={data['stock']}")
 
-    print(f"\n=== PEDIDOS GENERADOS: {len(pedidos)} ===")
-    for p in pedidos:
-        items_str = ", ".join(f"{it.codigo_producto}x{it.cantidad}" for it in p.items)
-        print(f"  {p.id_pedido} | cliente='{p.cliente}' | items=[{items_str}]")
+    print(f"\n=== ORDERS GENERATED: {len(orders)} ===")
+    for o in orders:
+        items_str = ", ".join(f"{it.product_code}x{it.quantity}" for it in o.items)
+        print(f"  {o.order_id} | customer='{o.customer}' | items=[{items_str}]")
 
-    print(f"\nTamano de la cola compartida: {cola.qsize()} pedidos listos para procesar.")
+    print(f"\nShared queue size: {order_queue.qsize()} orders ready to process.")
