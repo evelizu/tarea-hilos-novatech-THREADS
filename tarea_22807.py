@@ -18,6 +18,7 @@ inventory = {
 customers = ["Ana Lopez", "Mario Perez", "Carlos Ruiz", "Lucia Gomez", "Jorge Diaz", "Marta Silva"]
 
 orders_queue = queue.Queue()
+inventory_lock = threading.Lock()
 
 def generate_orders():
     product_codes = list(inventory.keys())
@@ -39,3 +40,46 @@ generate_orders()
 
 print(f"Inventory loaded with {len(inventory)} products.")
 print(f"Orders queue generated with {orders_queue.qsize()} pending orders.")
+print("-" * 50)
+
+# ==========================================
+# PHASE 2: THREADING AND WORKERS
+# ==========================================
+
+def process_orders(worker_name):
+    while not orders_queue.empty():
+        try:
+            order = orders_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        product_code = order["product"]
+        requested_qty = order["quantity"]
+
+        # Acquire lock to update stock safely
+        with inventory_lock:
+            if product_code in inventory:
+                if inventory[product_code]["stock"] >= requested_qty:
+                    inventory[product_code]["stock"] -= requested_qty
+                    print(f"[{worker_name}] PROCESSED: Order {order['id']} - Customer: {order['customer']} | Product: {inventory[product_code]['name']} | Qty: {requested_qty} | Remaining stock: {inventory[product_code]['stock']}")
+                else:
+                    print(f"[{worker_name}] REJECTED: Order {order['id']} - Insufficient stock for product {product_code} (Requested: {requested_qty}, Stock: {inventory[product_code]['stock']})")
+            else:
+                print(f"[{worker_name}] ERROR: Order {order['id']} - Product code {product_code} does not exist in inventory.")
+
+        time.sleep(0.1)  # Simulate processing time
+        orders_queue.task_done()
+
+# Create 3 worker threads
+workers = []
+for i in range(1, 4):
+    t = threading.Thread(target=process_orders, args=(f"Worker-{i}",))
+    workers.append(t)
+    t.start()
+
+# Wait for all threads to complete
+for t in workers:
+    t.join()
+
+print("-" * 50)
+print("All orders have been processed.")
